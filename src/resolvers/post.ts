@@ -1,0 +1,191 @@
+import { Post } from "../entitites/Post";
+import {
+  Arg,
+  Ctx,
+  Field,
+  FieldResolver,
+  InputType,
+  Int,
+  Mutation,
+  ObjectType,
+  Query,
+  Resolver,
+  Root,
+  UseMiddleware,
+} from "type-graphql";
+import { MyContext } from "../types";
+import { isAuth } from "../middleware/isAuth";
+import { getConnection } from "typeorm";
+import { Updoot } from "../entitites/Updoots";
+import { User } from "../entitites/User";
+
+@InputType()
+class PostInput {
+  @Field()
+  title: string;
+
+  @Field()
+  text: string;
+}
+
+@ObjectType()
+class PaginatedPosts {
+  @Field(() => [Post])
+  posts: Post[];
+
+  @Field()
+  hasMore: boolean;
+}
+
+@Resolver(Post)
+export class PostResolver {
+  @FieldResolver(() => User)
+  creator(@Root() post: Post, @Ctx() { userLoader }: MyContext) {
+    return userLoader.load(post.creatorId);
+  }
+
+  @FieldResolver(() => Int, { nullable: true })
+  async voteStatus(
+    @Root() post: Post,
+    @Ctx() { updootLoader, req }: MyContext
+  ) {
+    const userId = req.session.userId;
+    if (!userId) return null;
+
+    const updoot = await updootLoader.load({
+      postId: post.id,
+      userId,
+    });
+
+    return updoot?.value;
+  }
+
+  @Query(() => PaginatedPosts)
+  async posts(
+    @Arg("limit", () => Int) limit: number,
+    @Arg("cursor", () => String, { nullable: true }) cursor: string | null
+  ): Promise<PaginatedPosts> {
+    const realLimit = Math.min(50, limit);
+    const realLimitPlusOne = Math.min(50, limit) + 1;
+
+    const replacements: any[] = [realLimitPlusOne];
+
+    if (cursor) {
+      replacements.push(new Date(parseInt(cursor)));
+    }
+
+    const posts = await getConnection().query(
+      `
+      select p.*
+      from post p
+      ${cursor ? `where p."createdAt" < $2` : ""}
+      order by p."createdAt" DESC
+      limit $1
+    `,
+      replacements
+    );
+
+    const hasMore = posts.length === realLimitPlusOne;
+
+    return { posts: posts.slice(0, realLimit), hasMore };
+  }
+
+  @Query(() => Post, { nullable: true })
+  post(@Arg("id", () => Int) id: number): Promise<Post | undefined> {
+    return Post.findOne(id);
+  }
+
+  @Mutation(() => Post)
+  @UseMiddleware(isAuth)
+  createPost(
+    @Arg("input") input: PostInput,
+    @Ctx() { req }: MyContext
+  ): Promise<Post> {
+    return Post.create({
+      ...input,
+      creatorId: req.session.userId,
+    }).save();
+  }
+
+  @Mutation(() => Post, { nullable: true })
+  @UseMiddleware(isAuth)
+  async updatePost(
+    @Arg("id", () => Int) id: number,
+    @Arg("title") title: string,
+    @Arg("text") text: string,
+    @Ctx() { req }: MyContext
+  ): Promise<Post | null> {
+    await Post.update({ id, creatorId: req.session.userId }, { title, text });
+
+    const result = await getConnection()
+      .createQueryBuilder()
+      .update(Post)
+      .set({ title, text })
+      .where('id = :id and "creatorId" = :creatorId', {
+        id,
+        creatorId: req.session.userId,
+      })
+      .returning("*")
+      .execute();
+
+    return result.raw[0];
+  }
+
+  @Mutation(() => Boolean)
+  @UseMiddleware(isAuth)
+  async deletePost(
+    @Arg("id", () => Int) id: number,
+    @Ctx() { req }: MyContext
+  ): Promise<Boolean> {
+    const post = await Post.findOne(id);
+    if (!post) return false;
+
+    await Post.delete({ id, creatorId: req.session.userId });
+    return true;
+  }
+
+  @Mutation(() => Boolean)
+  @UseMiddleware(isAuth)
+  async vote(
+    @Arg("postId", () => Int) postId: number,
+    @Arg("value", () => Int) value: number,
+    @Ctx() { req }: MyContext
+  ): Promise<boolean> {
+    const { userId } = req.session;
+    const previousUpdoot = await Updoot.findOne({ where: { postId, userId } });
+
+    const previousVoteStatus = previousUpdoot?.value || 0;
+    const newVoteStatus = previousVoteStatus + value;
+
+    const isVoteValid = [-1, 0, 1].includes(newVoteStatus);
+    if (!isVoteValid) return false;
+
+    await getConnection().transaction(async (transactionManager) => {
+      const createUpdoot = `
+        insert into updoot (value, "postId", "userId")
+        values ($1, $2, $3)
+      `;
+
+      const updateUpdoot = `
+        update updoot
+        set value = $1
+        where "postId" = $2 and "userId" = $3
+      `;
+
+      await transactionManager.query(
+        previousUpdoot ? updateUpdoot : createUpdoot,
+        [newVoteStatus, postId, userId]
+      );
+
+      const updatePost = `
+        update post
+        set points = points + $1
+        where id = $2
+      `;
+
+      await transactionManager.query(updatePost, [value, postId]);
+    });
+
+    return true;
+  }
+}
